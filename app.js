@@ -4,7 +4,7 @@
  * - Supports manual local file import (CSV/TSV) to bypass hosting/path issues
  * - Normalizes headers & place names, builds route index, and searches by date
  */
-const APP_VERSION = "v11-2026-02-12";
+const APP_VERSION = "v11.2-2026-02-12";
 
 const DB = {
   meta: {
@@ -342,19 +342,20 @@ function findFare(date, from, to){
   const listFT = DB.routeMap.get(keyFT) || [];
   const listTF = DB.routeMap.get(keyTF) || [];
 
+  const hasAnyRoute = (listFT.length > 0) || (listTF.length > 0);
+
   let best = pickBest(listFT, date);
   if (best){
-    return { hit:true, row:best, from:f, to:t, tried:[`${f}→${t}`] };
+    return { hit:true, row:best, from:f, to:t, tried:[`${f}→${t}`], hasAnyRoute, usedReverse:false };
   }
 
   best = pickBest(listTF, date);
   if (best){
-    return { hit:true, row:{...best, note:"※逆方向データを使用"}, from:f, to:t, tried:[`${f}→${t}`, `${t}→${f}`] };
+    // Reverse-direction fallback is allowed, but we do not display any note in the UI.
+    return { hit:true, row:best, from:f, to:t, tried:[`${f}→${t}`, `${t}→${f}`], hasAnyRoute, usedReverse:true };
   }
 
-  const near = [...listFT, ...listTF].sort((a,b)=>a.validFrom - b.validFrom).slice(0,5);
-
-  return { hit:false, row:null, from:f, to:t, tried:[`${f}→${t}`, `${t}→${f}`], near };
+  return { hit:false, row:null, from:f, to:t, tried:[`${f}→${t}`, `${t}→${f}`], hasAnyRoute };
 }
 
 // -----------------------------
@@ -501,41 +502,75 @@ function renderLegs(){
   });
 }
 
+function recalcTotalsFromTable(){
+  const meta = window.__resultMeta || { totalHits: 0, totalMisses: 0 };
+  const checks = Array.from(document.querySelectorAll('#resultTable tbody input.rowInclude'));
+  let sum = 0;
+  let selectedHits = 0;
+
+  for (const ch of checks){
+    const fare = Number(ch.dataset.fare || "0");
+    const tr = ch.closest("tr");
+    if (ch.checked && Number.isFinite(fare)){
+      sum += Math.trunc(fare);
+      selectedHits++;
+      if (tr) tr.classList.remove("excluded");
+    } else {
+      if (tr) tr.classList.add("excluded");
+    }
+  }
+
+  safeText("#sumFare", selectedHits ? money(sum) : "-");
+  safeText("#hitCount", meta.totalHits ? `${selectedHits}/${meta.totalHits}` : "0");
+  safeText("#missCount", String(meta.totalMisses));
+}
+
 function renderResults(rows, misses){
   const tbody = $("#resultTable tbody");
   if (!tbody) return;
 
   tbody.innerHTML = "";
-  let sum = 0;
-  let hit = 0;
 
-  for (const r of rows){
+  const totalHits = (rows || []).filter(r => r.hit && Number.isFinite(r.row?.fare)).length;
+  const totalMisses = (rows || []).length - totalHits;
+
+  window.__resultMeta = { totalHits, totalMisses };
+
+  for (const r of (rows || [])){
     const tr = document.createElement("tr");
 
-    if (r.hit && Number.isFinite(r.row?.fare)){
-      sum += Math.trunc(r.row.fare);
-      hit++;
-    }
+    const chk = r.hit
+      ? `<input type="checkbox" class="rowInclude" data-fare="${Number(r.row?.fare || 0)}" checked />`
+      : `<input type="checkbox" disabled />`;
+
+    const status = r.hit
+      ? `${ymd(r.row.validFrom)}〜${ymd(r.row.validTo)}`
+      : (r.hasAnyRoute ? `<span class="pill amber">期間外</span>` : `<span class="pill red">未登録</span>`);
 
     tr.innerHTML = `
+      <td class="chk">${chk}</td>
       <td>${ymd(r.leg.date)}</td>
       <td>${r.from}</td>
       <td>${r.to}</td>
       <td>${r.hit ? (r.row.priceType || "-") : `<span class="pill red">未ヒット</span>`}</td>
       <td class="num">${r.hit ? money(r.row.fare) : "-"}</td>
-      <td>${r.hit ? `${ymd(r.row.validFrom)}〜${ymd(r.row.validTo)}${r.row.note ? " " + r.row.note : ""}` : (r.near?.length ? "候補あり（期間外/逆方向）" : "データなし")}</td>
+      <td>${status}</td>
     `;
     tbody.appendChild(tr);
   }
 
-  safeText("#sumFare", hit ? money(sum) : "-");
-  safeText("#hitCount", String(hit));
-  safeText("#missCount", String(rows.length - hit));
+  // Wire checkbox events (recalculate totals in-place)
+  tbody.querySelectorAll("input.rowInclude").forEach(ch => {
+    ch.addEventListener("change", recalcTotalsFromTable);
+  });
 
-  // Diagnostics: misses
+  // Update totals + counts
+  recalcTotalsFromTable();
+
+  // Diagnostics: misses (no candidate hints; keep it minimal)
   const missLines = (misses || []).map(m => {
-    const cand = (m.near || []).map(n => `${n.from}→${n.to} ${ymd(n.validFrom)}〜${ymd(n.validTo)} ${n.priceType} ${money(n.fare)}`).join(" | ");
-    return `- ${ymd(m.leg.date)} ${m.from}→${m.to} | tried: ${m.tried.join(" / ")}\n  candidates: ${cand || "-"}`;
+    const reason = m.hasAnyRoute ? "期間外" : "未登録";
+    return `- ${ymd(m.leg.date)} ${m.from}→${m.to} (${reason})`;
   }).join("\n");
   safeText("#diagMisses", missLines || "（未ヒットなし）");
 
@@ -853,6 +888,23 @@ async function loadDBFromLocalFile(file){
 function bindUI(){
   window.__legs = [];
 
+// Date quick actions (②フォーム)
+$("#btnDateToday")?.addEventListener("click", (e) => {
+  e.preventDefault();
+  const el = $("#legDate");
+  if (el) el.value = ymd(new Date());
+});
+
+$("#btnDatePlus1")?.addEventListener("click", (e) => {
+  e.preventDefault();
+  const el = $("#legDate");
+  const base = el?.value ? parseDateLoose(el.value) : new Date();
+  const d = base ? new Date(base) : new Date();
+  d.setDate(d.getDate() + 1);
+  if (el) el.value = ymd(d);
+});
+
+
   $("#btnParse")?.addEventListener("click", () => {
     const { legs, errors } = parseItineraryLines($("#itineraryText")?.value || "");
     if (errors.length){
@@ -948,6 +1000,12 @@ async function boot(){
   safeText("#dbLoadMsg", "");
   setSelectLoading();
   bindUI();
+
+  // UI defaults
+  const ld = $("#legDate");
+  if (ld && !ld.value) ld.value = ymd(new Date());
+  safeText("#topMeta", APP_VERSION);
+
   renderLegs();
   runSearch();
 
